@@ -86,6 +86,13 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+# NOTE: importing ``transformers.TrainerCallback`` here pulls transformers
+# into sys.modules the moment anyone does ``from training.grpo_hf_job
+# import ...``. On Colab + Unsloth that order matters — Unsloth has to be
+# imported BEFORE transformers to apply its kernel patches. The Colab
+# notebook (training/grpo_colab.ipynb) does ``import unsloth`` once at the
+# top of Phase 0 to satisfy this constraint before importing this module.
 from transformers import TrainerCallback
 
 
