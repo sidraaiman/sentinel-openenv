@@ -97,7 +97,31 @@ try:
 except ImportError:
     pass
 
-from transformers import TrainerCallback
+# NOTE: we deliberately DO NOT import transformers at module top.
+# On Colab + Unsloth, importing transformers eagerly (just to grab
+# TrainerCallback) poisons the kernel for any later ``from unsloth import
+# FastLanguageModel`` because Unsloth's monkey-patches won't apply once
+# transformers is in sys.modules. Many notebook cells need lightweight
+# helpers from this module (warmup_sentinel, build_tool_env_cls) and
+# should not pay for transformers being loaded. ``TrackingCallback``
+# subclasses ``transformers.TrainerCallback`` lazily — see below.
+TrainerCallback: type = object  # placeholder; rebound at first use
+
+
+def _ensure_trainer_callback() -> type:
+    """Lazy-import transformers.TrainerCallback the first time it's needed.
+
+    Called from inside ``TrackingCallback.__init_subclass__``-equivalent
+    plumbing below — i.e. only when actually building the GRPO trainer,
+    not when the notebook merely imports ``warmup_sentinel`` or
+    ``build_tool_env_cls``.
+    """
+    global TrainerCallback
+    if TrainerCallback is object:
+        from transformers import TrainerCallback as _TC
+
+        TrainerCallback = _TC
+    return TrainerCallback
 
 
 def _detect_compute_dtypes() -> tuple[bool, bool]:
@@ -667,14 +691,38 @@ def run_sft(model, tokenizer, epochs: int, output_dir: str):
 # ============================================================================
 
 
-class TrackingCallback(TrainerCallback):
+class TrackingCallback:
     """Captures step / loss / reward, regenerates plots every 25 steps,
     saves checkpoints, and signals abort via control.should_training_stop.
 
-    MUST inherit from TrainerCallback — transformers>=4.55 dispatches events
-    via getattr(callback, event) with no hasattr fallback, so any event we
-    don't define would raise AttributeError. The base class supplies no-op
-    implementations of on_train_begin / on_init_end / on_save / etc."""
+    Lazy subclass of ``transformers.TrainerCallback`` — see ``__new__`` below.
+    transformers>=4.55 dispatches events via ``getattr(callback, event)`` with
+    no hasattr fallback, so we need TrainerCallback's no-op defaults
+    (on_train_begin / on_init_end / on_save / etc). But we don't want to
+    import transformers at module load time on Colab + Unsloth; instead
+    ``__new__`` consults ``_ensure_trainer_callback()`` and constructs an
+    instance of an inner subclass on first use.
+    """
+
+    _real_cls: type | None = None
+
+    def __new__(cls, *args, **kwargs):
+        if TrackingCallback._real_cls is None:
+            base = _ensure_trainer_callback()
+            if base is object:
+                # No transformers available — this is a smoke/lint env. The
+                # plain TrackingCallback methods are still defined below;
+                # they just won't be wired into a Trainer.
+                TrackingCallback._real_cls = TrackingCallback
+            else:
+                TrackingCallback._real_cls = type(
+                    "TrackingCallback",
+                    (cls, base),
+                    {},
+                )
+        real = TrackingCallback._real_cls
+        instance = object.__new__(real)
+        return instance
 
     def __init__(
         self,
