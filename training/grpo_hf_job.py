@@ -88,6 +88,33 @@ from typing import Any
 import requests
 from transformers import TrainerCallback
 
+
+def _detect_compute_dtypes() -> tuple[bool, bool]:
+    """Return ``(use_bf16, use_fp16)`` for the current GPU.
+
+    bfloat16 is only safe on Ampere+ (compute capability >= 8.0). On Turing
+    (T4, sm_75) it silently miscomputes — Trainer accepts ``bf16=True`` but
+    GRPO produces NaN losses within a few steps. We fall back to fp16 there.
+
+    The ``SENTINEL_FORCE_FP16=1`` / ``SENTINEL_FORCE_BF16=1`` env vars are an
+    operator override for unusual hardware (e.g. CPU-only smoke tests).
+    """
+    if os.environ.get("SENTINEL_FORCE_FP16", "0") == "1":
+        return False, True
+    if os.environ.get("SENTINEL_FORCE_BF16", "0") == "1":
+        return True, False
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False, False
+        major, _minor = torch.cuda.get_device_capability(0)
+        if major >= 8:
+            return True, False
+        return False, True
+    except Exception:
+        return True, False
+
 # vLLM 0.9.x v1 engine raises "AoT scheduling is required for full cuda graph"
 # when unsloth_zoo constructs LLM(...) with default cudagraph settings. Falling
 # back to the legacy v0 engine sidesteps that check; v0 is still functional in
@@ -214,17 +241,31 @@ SFT_CONFIG = dict(
     max_seq_length=1024,
 )
 
+# Each value can be overridden via SENTINEL_GRPO_<KEY> env var (e.g.
+# SENTINEL_GRPO_MAX_STEPS=60). The defaults target an L4/A100 — the Colab
+# T4 notebook lowers num_generations/max_completion_length/max_steps via env
+# vars to fit in 16 GB and the free-tier wall clock.
+def _grpo_int(name: str, default: int) -> int:
+    raw = os.environ.get(f"SENTINEL_GRPO_{name.upper()}")
+    return int(raw) if raw not in (None, "") else default
+
+
+def _grpo_float(name: str, default: float) -> float:
+    raw = os.environ.get(f"SENTINEL_GRPO_{name.upper()}")
+    return float(raw) if raw not in (None, "") else default
+
+
 GRPO_CONFIG = dict(
-    num_generations=4,
-    max_completion_length=512,
-    gradient_accumulation_steps=8,
-    learning_rate=5e-6,
-    beta=0.04,
+    num_generations=_grpo_int("num_generations", 4),
+    max_completion_length=_grpo_int("max_completion_length", 512),
+    gradient_accumulation_steps=_grpo_int("gradient_accumulation_steps", 8),
+    learning_rate=_grpo_float("learning_rate", 5e-6),
+    beta=_grpo_float("beta", 0.04),
     num_train_epochs=1,
-    max_steps=400,
-    logging_steps=5,
-    save_steps=25,
-    eval_steps=25,
+    max_steps=_grpo_int("max_steps", 400),
+    logging_steps=_grpo_int("logging_steps", 5),
+    save_steps=_grpo_int("save_steps", 25),
+    eval_steps=_grpo_int("eval_steps", 25),
     lr_scheduler_type="cosine",
     warmup_ratio=0.05,
 )
@@ -580,6 +621,7 @@ def run_sft(model, tokenizer, epochs: int, output_dir: str):
 
     ds_text = ds.map(preprocess, batched=True, remove_columns=ds.column_names)
 
+    use_bf16, use_fp16 = _detect_compute_dtypes()
     cfg = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -590,7 +632,8 @@ def run_sft(model, tokenizer, epochs: int, output_dir: str):
         warmup_steps=10,
         logging_steps=5,
         save_steps=200,
-        bf16=True,
+        bf16=use_bf16,
+        fp16=use_fp16,
         optim="paged_adamw_8bit",
         report_to=os.environ.get("SENTINEL_REPORT_TO", "none"),
         packing=False,
@@ -776,6 +819,7 @@ def _build_grpo_trainer(model, tokenizer, dataset, callback, output_dir: str, ma
     # `make_grpo_dataset` precomputes one (prompt, ground_truth) row per
     # Overseer decision, and `reward_func` grades each completion in pure
     # Python via `graders.grade_overseer_decision`.
+    use_bf16, use_fp16 = _detect_compute_dtypes()
     cfg_kwargs = dict(
         output_dir=output_dir,
         num_generations=GRPO_CONFIG["num_generations"],
@@ -789,7 +833,8 @@ def _build_grpo_trainer(model, tokenizer, dataset, callback, output_dir: str, ma
         warmup_ratio=GRPO_CONFIG["warmup_ratio"],
         logging_steps=GRPO_CONFIG["logging_steps"],
         save_steps=GRPO_CONFIG["save_steps"],
-        bf16=True,
+        bf16=use_bf16,
+        fp16=use_fp16,
         optim="paged_adamw_8bit",
         report_to=os.environ.get("SENTINEL_REPORT_TO", "none"),
     )
@@ -1471,6 +1516,7 @@ def main() -> int:
         model=model,
         plot_loss_fn=project["plot_loss"],
         plot_reward_fn=project["plot_reward"],
+        plot_every=GRPO_CONFIG["save_steps"],
         is_smoke=True,
     )
     smoke_trainer = _build_grpo_trainer(
@@ -1489,6 +1535,7 @@ def main() -> int:
             model=model,
             plot_loss_fn=project["plot_loss"],
             plot_reward_fn=project["plot_reward"],
+            plot_every=GRPO_CONFIG["save_steps"],
             is_smoke=True,
         )
         smoke_trainer2 = _build_grpo_trainer(
@@ -1519,6 +1566,7 @@ def main() -> int:
         model=model,
         plot_loss_fn=project["plot_loss"],
         plot_reward_fn=project["plot_reward"],
+        plot_every=GRPO_CONFIG["save_steps"],
     )
     long_trainer = _build_grpo_trainer(
         model, tokenizer, long_ds, long_cb,
@@ -1537,6 +1585,7 @@ def main() -> int:
             model=model,
             plot_loss_fn=project["plot_loss"],
             plot_reward_fn=project["plot_reward"],
+            plot_every=GRPO_CONFIG["save_steps"],
         )
         retry_trainer = _build_grpo_trainer(
             model, tokenizer, long_ds, retry_cb,
