@@ -87,12 +87,16 @@ from typing import Any
 
 import requests
 
-# NOTE: importing ``transformers.TrainerCallback`` here pulls transformers
-# into sys.modules the moment anyone does ``from training.grpo_hf_job
-# import ...``. On Colab + Unsloth that order matters — Unsloth has to be
-# imported BEFORE transformers to apply its kernel patches. The Colab
-# notebook (training/grpo_colab.ipynb) does ``import unsloth`` once at the
-# top of Phase 0 to satisfy this constraint before importing this module.
+# CRITICAL: Unsloth has to be imported BEFORE transformers so it can monkey-
+# patch transformers' attention kernels. ``from training.grpo_hf_job import
+# ...`` is the most common entry point, so we enforce the order HERE — that
+# way the Colab notebook can't accidentally break it by reordering cells.
+# The try/except is for CPU-only smoke runs where unsloth isn't installed.
+try:
+    import unsloth  # noqa: F401 — must come before transformers
+except ImportError:
+    pass
+
 from transformers import TrainerCallback
 
 
