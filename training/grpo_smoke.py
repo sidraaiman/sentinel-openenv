@@ -325,6 +325,16 @@ def main():
 
     ds = _make_smoke_dataset(n_samples=16, task_id="action_screen")
 
+    # bfloat16 is only safe on Ampere+ (compute capability >= 8.0). On Turing
+    # GPUs (T4, sm_75) we fall back to fp16 — bf16 silently produces NaN losses.
+    use_bf16 = False
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            use_bf16 = _torch.cuda.get_device_capability(0)[0] >= 8
+    except Exception:
+        pass
+
     cfg = GRPOConfig(
         use_vllm=True,
         vllm_mode="colocate",
@@ -336,7 +346,8 @@ def main():
         max_steps=2,  # SMOKE ONLY
         logging_steps=1,
         output_dir="outputs/sentinel_smoke",
-        bf16=True,
+        bf16=use_bf16,
+        fp16=not use_bf16,
     )
 
     # NOTE: trl 0.21 has no `environment_factory` mechanism (TRL 0.22+ feature).
